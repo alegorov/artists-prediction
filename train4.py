@@ -9,6 +9,7 @@ from tqdm import tqdm
 import random
 import torch.nn.functional as F
 import torchaudio
+from utils import AttentionPooling
 
 
 # Data Loader
@@ -22,23 +23,42 @@ def train_val_split(dataset, val_size=0.2):  # Сплит по artistid
 
 
 class FeaturesLoader:
-    def __init__(self, features_dir_path, meta_info, device='cpu'):
+    def __init__(self, features_dir_path, meta_info, device='cpu', randomize=False):
         self.features_dir_path = features_dir_path
         self.meta_info = meta_info
         self.trackid2path = meta_info.set_index('trackid')['archive_features_path'].to_dict()
         self.device = device
+        self.randomize = randomize
 
     def _load_item(self, track_id):
         track_features_file_path = self.trackid2path[track_id]
-        track_features = np.load(os.path.join(self.features_dir_path, track_features_file_path))
-        track_features = np.transpose(track_features)
-        N = 3
-        track_features = np.concatenate([track_features] * N, axis=0)[:61 * N]
-        return track_features
+        mag_spec = np.load(os.path.join(self.features_dir_path, track_features_file_path))
+        h, w = mag_spec.shape
+        ## zero-padding to (512, 81)
+        if mag_spec.shape != (512, 81):
+            mag_spec = np.hstack([mag_spec, np.zeros((512, 81 - w))])
+        ## mask all zero-padding tokens in attention pooling
+        mask = np.ones((81,))
+        mask[:w] = 0
+
+        mag_spec = np.transpose(mag_spec)
+
+        if self.randomize:
+            indices = list(np.random.randint(0, w, w))
+            indices = indices + list(range(w, mag_spec.shape[0]))
+            mag_spec = mag_spec[indices, :]
+
+        return mag_spec.tolist(), mask.tolist(), w
 
     def load_batch(self, tracks_ids):
         batch = [self._load_item(track_id) for track_id in tracks_ids]
-        return torch.tensor(np.array(batch)).to(self.device)
+        x = [e[0] for e in batch]
+        mask = [e[1] for e in batch]
+        lengths = [e[2] for e in batch]
+
+        return torch.tensor(x, dtype=torch.float32, device=self.device), \
+               torch.tensor(mask, dtype=torch.bool, device=self.device), \
+               torch.tensor(lengths, dtype=torch.int64, device=self.device)
 
 
 class TrainLoader:
@@ -66,8 +86,8 @@ class TrainLoader:
                 track_ids.append(track_id)
                 ids.append(id)
             if len(track_ids) >= self.batch_size:
-                x = self.features_loader.load_batch(track_ids)
-                yield x, ids
+                x, mask, lengths = self.features_loader.load_batch(track_ids)
+                yield x, mask, lengths, ids
                 track_ids = []
                 ids = []
 
@@ -82,12 +102,14 @@ class TestLoader:
         for track_id in tqdm(self.features_loader.meta_info['trackid'].values):
             batch_ids.append(track_id)
             if len(batch_ids) == self.batch_size:
-                yield batch_ids, self.features_loader.load_batch(batch_ids)
+                x, mask, lengths = self.features_loader.load_batch(batch_ids)
+                yield batch_ids, x, mask, lengths
                 batch_ids = []
         if len(batch_ids) > 0:
-            yield batch_ids, self.features_loader.load_batch(batch_ids)
+            x, mask, lengths = self.features_loader.load_batch(batch_ids)
+            yield batch_ids, x, mask, lengths
 
-        # Loss & Metrics
+            # Loss & Metrics
 
 
 class NT_Xent(nn.Module):
@@ -97,8 +119,11 @@ class NT_Xent(nn.Module):
         self.negative_weight = negative_weight
         self.similarity_f = nn.CosineSimilarity(dim=2)
 
+        self.positive_sum = 0.
+        self.negative_sum = 0.
+
     def forward(self, z, ids):
-        sim = self.similarity_f(z.unsqueeze(1), z.unsqueeze(0)) / self.temperature
+        sim = self.similarity_f(z.unsqueeze(1), z.unsqueeze(0))
 
         N = len(ids)
 
@@ -114,13 +139,20 @@ class NT_Xent(nn.Module):
 
         clip = 70.
 
-        positive_sim = clip * torch.tanh((1. / clip) * sim[positive_mask])
-        negative_sim = clip * torch.tanh((1. / clip) * sim[negative_mask])
+        positive_sim = clip * torch.tanh((1. / (clip * self.temperature)) * sim[positive_mask])
+        negative_sim = clip * torch.tanh((1. / (clip * self.temperature)) * sim[negative_mask])
 
-        positive_norm = torch.exp(positive_sim).mean()
+        positive_norm = torch.exp(positive_sim)
         negative_norm = torch.exp(negative_sim).mean()
 
-        loss = torch.log(positive_norm + self.negative_weight * negative_norm) - positive_sim.mean()
+        beta = 0.999
+
+        self.positive_sum = beta * self.positive_sum + positive_norm.mean().item()
+        self.negative_sum = beta * self.negative_sum + negative_norm.item()
+
+        negative_norm *= self.negative_weight * (self.positive_sum / self.negative_sum)
+
+        loss = torch.log(positive_norm + negative_norm).mean() - positive_sim.mean()
         return loss
 
 
@@ -190,25 +222,26 @@ def eval_submission(submission, gt_meta_info, top_size=100):
 
 
 class BasicNet(nn.Module):
-    def __init__(self, output_features_size):
+    def __init__(self):
         super().__init__()
-        self.output_features_size = output_features_size
+        self.output_features_size = 512
 
-        self.emformer = torchaudio.models.Emformer(
+        self.conformer = torchaudio.models.Conformer(
             input_dim=512,
             num_heads=4,
-            ffn_dim=128,
-            num_layers=4,
-            segment_length=4,
-            right_context_length=1
+            ffn_dim=512,
+            num_layers=3,
+            depthwise_conv_kernel_size=31
         )
 
-    def forward(self, x):
-        lengths = torch.tensor([x.shape[1]] * x.shape[0], dtype=torch.int64, device=x.device)
+        self.pooling = AttentionPooling(self.output_features_size)
+        self.bn = nn.BatchNorm1d(self.output_features_size, momentum=0.07)
 
-        x = self.emformer(x, lengths)
-        x = x[0].mean(axis=1)
-
+    def forward(self, x, mask, lengths):
+        x = self.conformer(x, lengths)
+        x = x[0]
+        x = self.pooling(x, mask)
+        x = self.bn(x)
         return x
 
 
@@ -227,8 +260,8 @@ class SimCLR(nn.Module):
                 nn.Linear(self.n_features, self.projection_dim, bias=False),
             )
 
-    def forward(self, x):
-        h = self.encoder(x)
+    def forward(self, x, mask, lengths):
+        h = self.encoder(x, mask, lengths)
 
         if self.projection_dim:
             z = self.projector(h)
@@ -241,9 +274,9 @@ class SimCLR(nn.Module):
 def inference(model, loader):
     embeds = dict()
     model.eval()
-    for tracks_ids, tracks_features in loader:
+    for tracks_ids, x, mask, lengths in loader:
         with torch.no_grad():
-            tracks_embeds = model(tracks_features)
+            tracks_embeds = model(x, mask, lengths)
             for track_id, track_embed in zip(tracks_ids, tracks_embeds):
                 embeds[track_id] = track_embed.cpu().numpy()
     return embeds
@@ -254,14 +287,16 @@ def train(model, train_loader, val_loader, valset_meta, optimizer, criterion, nu
     max_ndcg = None
     for epoch in range(num_epochs):
         model.train()
-        for x, ids in tqdm(train_loader):
+        for x, mask, lengths, ids in tqdm(train_loader):
             optimizer.zero_grad()
-            h, z = model(x)
+            h, z = model(x, mask, lengths)
             loss = criterion(z, ids)
             loss.backward()
             optimizer.step()
             print("Epoch {}/{}".format(epoch + 1, num_epochs))
             print("loss: {}".format(loss))
+            print("coef: {}".format(criterion.positive_sum / criterion.negative_sum))
+
             print()
 
         model.eval()
@@ -323,13 +358,12 @@ def main():
     # device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = 'cuda'
 
-    BATCH_SIZE = 140
-    N_CHANNELS = 512
+    BATCH_SIZE = 290
     PROJECTION_DIM = 0
-    NUM_EPOCHS = 25
+    NUM_EPOCHS = 221
     LR = 1e-4
-    TEMPERATURE = 0.011
-    NEGATIVE_WEIGHT = 930.
+    TEMPERATURE = 0.022
+    NEGATIVE_WEIGHT = 340.
 
     TRAINSET_PATH = os.path.join(args.base_dir, TRAINSET_DIRNAME)
     TESTSET_PATH = os.path.join(args.base_dir, TESTSET_DIRNAME)
@@ -340,7 +374,7 @@ def main():
     CHECKPOINT_PATH = os.path.join(args.base_dir, CHECKPOINT_FILENAME)
 
     sim_clr = SimCLR(
-        encoder=BasicNet(N_CHANNELS),
+        encoder=BasicNet(),
         projection_dim=PROJECTION_DIM
     ).to(device)
 
@@ -358,7 +392,8 @@ def main():
         print("Train")
         train(
             model=sim_clr,
-            train_loader=TrainLoader(FeaturesLoader(TRAINSET_PATH, train_meta_info, device), batch_size=BATCH_SIZE),
+            train_loader=TrainLoader(FeaturesLoader(TRAINSET_PATH, train_meta_info, device, True),
+                                     batch_size=BATCH_SIZE),
             val_loader=TestLoader(FeaturesLoader(TRAINSET_PATH, validation_meta_info, device), batch_size=BATCH_SIZE),
             valset_meta=validation_meta_info,
             optimizer=torch.optim.Adam(sim_clr.parameters(), lr=LR),
@@ -371,7 +406,7 @@ def main():
 
     print("Submission")
     test_loader = TestLoader(FeaturesLoader(TESTSET_PATH, test_meta_info, device), batch_size=BATCH_SIZE)
-    model = BasicNet(N_CHANNELS).to(device)
+    model = BasicNet().to(device)
     model.load_state_dict(torch.load(CHECKPOINT_PATH))
     embeds = inference(model, test_loader)
     submission = get_ranked_list(embeds, 100, device)

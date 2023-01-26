@@ -8,8 +8,7 @@ import torch.nn as nn
 from tqdm import tqdm
 import random
 import torch.nn.functional as F
-from utils import FeedForward
-from utils import MHSA_branch
+import torchaudio
 from utils import AttentionPooling
 
 
@@ -45,19 +44,21 @@ class FeaturesLoader:
         mag_spec = np.transpose(mag_spec)
 
         if self.randomize:
-            indices = np.random.randint(0, mag_spec.shape[0], mag_spec.shape[0])
+            indices = list(np.random.randint(0, w, w))
+            indices = indices + list(range(w, mag_spec.shape[0]))
             mag_spec = mag_spec[indices, :]
-            mask = mask[indices]
 
-        return mag_spec.tolist(), mask.tolist()
+        return mag_spec.tolist(), mask.tolist(), w
 
     def load_batch(self, tracks_ids):
         batch = [self._load_item(track_id) for track_id in tracks_ids]
         x = [e[0] for e in batch]
         mask = [e[1] for e in batch]
+        lengths = [e[2] for e in batch]
 
         return torch.tensor(x, dtype=torch.float32, device=self.device), \
-               torch.tensor(mask, dtype=torch.bool, device=self.device)
+               torch.tensor(mask, dtype=torch.bool, device=self.device), \
+               torch.tensor(lengths, dtype=torch.int64, device=self.device)
 
 
 class TrainLoader:
@@ -85,8 +86,8 @@ class TrainLoader:
                 track_ids.append(track_id)
                 ids.append(id)
             if len(track_ids) >= self.batch_size:
-                x, mask = self.features_loader.load_batch(track_ids)
-                yield x, mask, ids
+                x, mask, lengths = self.features_loader.load_batch(track_ids)
+                yield x, mask, lengths, ids
                 track_ids = []
                 ids = []
 
@@ -101,12 +102,12 @@ class TestLoader:
         for track_id in tqdm(self.features_loader.meta_info['trackid'].values):
             batch_ids.append(track_id)
             if len(batch_ids) == self.batch_size:
-                x, mask = self.features_loader.load_batch(batch_ids)
-                yield batch_ids, x, mask
+                x, mask, lengths = self.features_loader.load_batch(batch_ids)
+                yield batch_ids, x, mask, lengths
                 batch_ids = []
         if len(batch_ids) > 0:
-            x, mask = self.features_loader.load_batch(batch_ids)
-            yield batch_ids, x, mask
+            x, mask, lengths = self.features_loader.load_batch(batch_ids)
+            yield batch_ids, x, mask, lengths
 
             # Loss & Metrics
 
@@ -225,26 +226,20 @@ class BasicNet(nn.Module):
         super().__init__()
         self.output_features_size = 512
 
-        input_size = 512
-        embedding_size = 512
+        self.emformer = torchaudio.models.Emformer(
+            input_dim=512,
+            num_heads=4,
+            ffn_dim=512,
+            num_layers=3,
+            segment_length=4
+        )
 
-        num_branches = 2
-        self.proj = FeedForward(input_size, mult=4)
-        self.mhsa_branches = nn.ParameterList([MHSA_branch(embedding_size) for _ in range(num_branches)])
-        self.pooling = AttentionPooling(embedding_size)
-        self.bn = nn.BatchNorm1d(self.output_features_size)
+        self.pooling = AttentionPooling(self.output_features_size)
 
-    def forward(self, x, mask):
-        x = self.proj(x)
-        prediction = None
-        for branch in self.mhsa_branches:
-            if prediction is None:
-                prediction = branch(x)
-            else:
-                prediction += branch(x)
-        x = prediction
+    def forward(self, x, mask, lengths):
+        x = self.emformer(x, lengths)
+        x = x[0]
         x = self.pooling(x, mask)
-        x = self.bn(x)
         return x
 
 
@@ -263,8 +258,8 @@ class SimCLR(nn.Module):
                 nn.Linear(self.n_features, self.projection_dim, bias=False),
             )
 
-    def forward(self, x, mask):
-        h = self.encoder(x, mask)
+    def forward(self, x, mask, lengths):
+        h = self.encoder(x, mask, lengths)
 
         if self.projection_dim:
             z = self.projector(h)
@@ -277,9 +272,9 @@ class SimCLR(nn.Module):
 def inference(model, loader):
     embeds = dict()
     model.eval()
-    for tracks_ids, x, mask in loader:
+    for tracks_ids, x, mask, lengths in loader:
         with torch.no_grad():
-            tracks_embeds = model(x, mask)
+            tracks_embeds = model(x, mask, lengths)
             for track_id, track_embed in zip(tracks_ids, tracks_embeds):
                 embeds[track_id] = track_embed.cpu().numpy()
     return embeds
@@ -290,9 +285,9 @@ def train(model, train_loader, val_loader, valset_meta, optimizer, criterion, nu
     max_ndcg = None
     for epoch in range(num_epochs):
         model.train()
-        for x, mask, ids in tqdm(train_loader):
+        for x, mask, lengths, ids in tqdm(train_loader):
             optimizer.zero_grad()
-            h, z = model(x, mask)
+            h, z = model(x, mask, lengths)
             loss = criterion(z, ids)
             loss.backward()
             optimizer.step()
@@ -357,13 +352,13 @@ def main():
     TESTSET_META_FILENAME = 'test_meta.tsv'
     SUBMISSION_FILENAME = 'submission.txt'
     MODEL_FILENAME = 'model.pt'
-    CHECKPOINT_FILENAME = 'best1.pt'
+    CHECKPOINT_FILENAME = 'best6.pt'
     # device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = 'cuda'
 
-    BATCH_SIZE = 390
+    BATCH_SIZE = 410
     PROJECTION_DIM = 0
-    NUM_EPOCHS = 200
+    NUM_EPOCHS = 110
     LR = 1e-4
     TEMPERATURE = 0.022
     NEGATIVE_WEIGHT = 340.

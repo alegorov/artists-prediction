@@ -8,6 +8,7 @@ import torch.nn as nn
 from tqdm import tqdm
 import random
 import torch.nn.functional as F
+from utils import AttentionPooling
 
 
 # Data Loader
@@ -96,8 +97,11 @@ class NT_Xent(nn.Module):
         self.negative_weight = negative_weight
         self.similarity_f = nn.CosineSimilarity(dim=2)
 
+        self.positive_sum = 0.
+        self.negative_sum = 0.
+
     def forward(self, z, ids):
-        sim = self.similarity_f(z.unsqueeze(1), z.unsqueeze(0)) / self.temperature
+        sim = self.similarity_f(z.unsqueeze(1), z.unsqueeze(0))
 
         N = len(ids)
 
@@ -113,13 +117,20 @@ class NT_Xent(nn.Module):
 
         clip = 70.
 
-        positive_sim = clip * torch.tanh((1. / clip) * sim[positive_mask])
-        negative_sim = clip * torch.tanh((1. / clip) * sim[negative_mask])
+        positive_sim = clip * torch.tanh((1. / (clip * self.temperature)) * sim[positive_mask])
+        negative_sim = clip * torch.tanh((1. / (clip * self.temperature)) * sim[negative_mask])
 
-        positive_norm = torch.exp(positive_sim).mean()
+        positive_norm = torch.exp(positive_sim)
         negative_norm = torch.exp(negative_sim).mean()
 
-        loss = torch.log(positive_norm + self.negative_weight * negative_norm) - positive_sim.mean()
+        beta = 0.999
+
+        self.positive_sum = beta * self.positive_sum + positive_norm.mean().item()
+        self.negative_sum = beta * self.negative_sum + negative_norm.item()
+
+        negative_norm *= self.negative_weight * (self.positive_sum / self.negative_sum)
+
+        loss = torch.log(positive_norm + negative_norm).mean() - positive_sim.mean()
         return loss
 
 
@@ -189,27 +200,25 @@ def eval_submission(submission, gt_meta_info, top_size=100):
 
 
 class BasicNet(nn.Module):
-    def __init__(self, output_features_size):
+    def __init__(self):
         super().__init__()
-        self.output_features_size = output_features_size
+        self.output_features_size = 1024
 
-        nhead = 8
-        dim_feedforward = 2048
-
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(512, nhead=nhead, dim_feedforward=dim_feedforward, dropout=0.25,
-                                       batch_first=True), num_layers=3)
-        self.pooling = nn.AdaptiveAvgPool1d(1)
+        self.rnn1 = nn.LSTM(512, self.output_features_size, num_layers=1)
+        self.rnn2 = nn.GRU(512, self.output_features_size, num_layers=1)
+        self.pooling = AttentionPooling(self.output_features_size)
+        self.bn = nn.BatchNorm1d(self.output_features_size, momentum=0.06)
 
     def forward(self, x):
-        # x = torch.transpose(x, 1, 2)
-        # x = x.permute((0, 2, 1))
-        # x = self.transformer(x.float())
+        x = x.transpose(0, 1)
 
-        x = self.transformer(x)
-        x = x.permute((0, 2, 1))
+        x1, _ = self.rnn1(x)
+        x2, _ = self.rnn2(x)
+
+        x = x1 + x2
+        x = x.transpose(0, 1)
         x = self.pooling(x)
-        x = x.squeeze()
+        x = self.bn(x)
         return x
 
 
@@ -263,6 +272,8 @@ def train(model, train_loader, val_loader, valset_meta, optimizer, criterion, nu
             optimizer.step()
             print("Epoch {}/{}".format(epoch + 1, num_epochs))
             print("loss: {}".format(loss))
+            print("coef: {}".format(criterion.positive_sum / criterion.negative_sum))
+
             print()
 
         model.eval()
@@ -324,13 +335,12 @@ def main():
     # device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = 'cuda'
 
-    BATCH_SIZE = 160
-    N_CHANNELS = 512
+    BATCH_SIZE = 240
     PROJECTION_DIM = 0
-    NUM_EPOCHS = 13
+    NUM_EPOCHS = 200
     LR = 1e-4
-    TEMPERATURE = 0.011
-    NEGATIVE_WEIGHT = 930.
+    TEMPERATURE = 0.022
+    NEGATIVE_WEIGHT = 340.
 
     TRAINSET_PATH = os.path.join(args.base_dir, TRAINSET_DIRNAME)
     TESTSET_PATH = os.path.join(args.base_dir, TESTSET_DIRNAME)
@@ -341,7 +351,7 @@ def main():
     CHECKPOINT_PATH = os.path.join(args.base_dir, CHECKPOINT_FILENAME)
 
     sim_clr = SimCLR(
-        encoder=BasicNet(N_CHANNELS),
+        encoder=BasicNet(),
         projection_dim=PROJECTION_DIM
     ).to(device)
 
@@ -372,7 +382,7 @@ def main():
 
     print("Submission")
     test_loader = TestLoader(FeaturesLoader(TESTSET_PATH, test_meta_info, device), batch_size=BATCH_SIZE)
-    model = BasicNet(N_CHANNELS).to(device)
+    model = BasicNet().to(device)
     model.load_state_dict(torch.load(CHECKPOINT_PATH))
     embeds = inference(model, test_loader)
     submission = get_ranked_list(embeds, 100, device)
